@@ -8,7 +8,27 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use tauri::{Emitter, Manager};
+fn ytdlp_executable(app: &tauri::AppHandle) -> PathBuf {
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let bundled = resource_dir.join("yt-dlp.exe");
+        if bundled.exists() {
+            return bundled;
+        }
 
+        let bundled_nested = resource_dir.join("resources").join("yt-dlp.exe");
+        if bundled_nested.exists() {
+            return bundled_nested;
+        }
+    }
+
+    PathBuf::from("yt-dlp")
+}
+
+fn ytdlp_available(app: &tauri::AppHandle) -> bool {
+    let executable = ytdlp_executable(app);
+
+    executable.exists() || media::command_exists("yt-dlp")
+}
 use db::Database;
 use models::{
     Candidate, EnvironmentStatus, MediaProbe, NormalizedTranscript, Project, ProjectDetail,
@@ -30,7 +50,10 @@ struct AppState {
 }
 
 #[tauri::command]
-async fn environment_status(state: tauri::State<'_, AppState>) -> Result<EnvironmentStatus, String> {
+async fn environment_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<EnvironmentStatus, String> {
     let llm_provider = std::env::var("LLM_PROVIDER")
         .unwrap_or_else(|_| "deepseek".to_string())
         .to_lowercase();
@@ -58,97 +81,47 @@ async fn environment_status(state: tauri::State<'_, AppState>) -> Result<Environ
         llm_provider,
         has_local_whisper_model,
         has_ollama,
-        has_ytdlp: media::command_exists("yt-dlp"),
+        has_ytdlp: ytdlp_available(&app),
     })
 }
 
 #[tauri::command]
-async fn pull_ollama_model(
+async fn check_youtube_copyright(
     app: tauri::AppHandle,
-    model_name: String,
-) -> Result<(), String> {
-    let client = reqwest::Client::new();
-    
-    let mut response = client
-        .post("http://localhost:11434/api/pull")
-        .json(&serde_json::json!({
-            "name": model_name,
-            "stream": true,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to connect to Ollama: {e}"))?;
+    url: String,
+) -> Result<CopyrightCheckResult, String> {
+    let executable = ytdlp_executable(&app);
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(format!("Ollama pull returned status {status}: {text}"));
-    }
+    tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new(&executable)
+            .args(&["--dump-json", &url])
+            .output()
+            .map_err(|e| format!("Failed to run yt-dlp: {}", e))?;
 
-    let mut buffer = String::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-        let chunk_str = String::from_utf8_lossy(&chunk);
-        buffer.push_str(&chunk_str);
-
-        // Process lines in buffer
-        while let Some(pos) = buffer.find('\n') {
-            let line = buffer[..pos].trim().to_string();
-            buffer = buffer[pos + 1..].to_string();
-
-            if line.is_empty() {
-                continue;
-            }
-
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                if let Some(err_msg) = val.get("error").and_then(|v| v.as_str()) {
-                    return Err(err_msg.to_string());
-                }
-
-                let completed = val.get("completed").and_then(|v| v.as_u64());
-                let total = val.get("total").and_then(|v| v.as_u64());
-
-                let mut status = val.get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Downloading...")
-                    .to_string();
-
-                if status.starts_with("downloading ") {
-                    if let (Some(c), Some(t)) = (completed, total) {
-                        let c_mb = c as f64 / 1024.0 / 1024.0;
-                        let t_mb = t as f64 / 1024.0 / 1024.0;
-                        if t_mb > 100.0 {
-                            status = format!("Downloading weights: {:.1} MB / {:.1} MB", c_mb, t_mb);
-                        } else {
-                            status = format!("Downloading model components: {:.1} MB / {:.1} MB", c_mb, t_mb);
-                        }
-                    } else {
-                        status = "Downloading model components...".to_string();
-                    }
-                }
-                
-                let percentage = if let (Some(c), Some(t)) = (completed, total) {
-                    if t > 0 {
-                        Some((c as f64 / t as f64) * 100.0)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                let payload = PullProgressPayload {
-                    status,
-                    completed,
-                    total,
-                    percentage,
-                };
-
-                let _ = app.emit("ollama-pull-progress", payload);
-            }
+        if !output.status.success() {
+            return Err("Failed to fetch video metadata from YouTube.".to_string());
         }
-    }
 
-    Ok(())
+        let json_str = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str)
+            .map_err(|_| "Failed to parse yt-dlp output".to_string())?;
+
+        let license = parsed
+            .get("license")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let is_safe = if let Some(lic) = &license {
+            lic.to_lowercase().contains("creative commons")
+                || lic.to_lowercase().contains("reuse allowed")
+        } else {
+            false
+        };
+
+        Ok(CopyrightCheckResult { is_safe, license })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -705,44 +678,20 @@ pub struct CopyrightCheckResult {
 }
 
 #[tauri::command]
-async fn check_youtube_copyright(url: String) -> Result<CopyrightCheckResult, String> {
-    tokio::task::spawn_blocking(move || {
-        let output = std::process::Command::new("yt-dlp")
-            .args(&["--dump-json", &url])
-            .output()
-            .map_err(|e| format!("Failed to run yt-dlp: {}", e))?;
+async fn download_youtube_video(
+    app: tauri::AppHandle,
+    url: String,
+) -> Result<String, String> {
+    let executable = ytdlp_executable(&app);
 
-        if !output.status.success() {
-            return Err("Failed to fetch video metadata from YouTube.".to_string());
-        }
-
-        let json_str = String::from_utf8_lossy(&output.stdout);
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).map_err(|_| "Failed to parse yt-dlp output".to_string())?;
-
-        let license = parsed.get("license").and_then(|v| v.as_str()).map(|s| s.to_string());
-        
-        let is_safe = if let Some(lic) = &license {
-            lic.to_lowercase().contains("creative commons") || lic.to_lowercase().contains("reuse allowed")
-        } else {
-            false
-        };
-
-        Ok(CopyrightCheckResult { is_safe, license })
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn download_youtube_video(url: String) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
         let downloads_dir = dirs::download_dir()
             .ok_or_else(|| "Could not find Downloads folder".to_string())?;
-        
+
         let output_template = downloads_dir.join("AutoShorts_%(id)s.%(ext)s");
         let output_template_str = output_template.to_string_lossy().to_string();
 
-        let output = std::process::Command::new("yt-dlp")
+        let output = std::process::Command::new(&executable)
             .args(&[
                 "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
                 "--merge-output-format", "mp4",
@@ -771,7 +720,6 @@ async fn download_youtube_video(url: String) -> Result<String, String> {
     .await
     .map_err(|e| e.to_string())?
 }
-
 fn project_dir(state: &AppState, project_id: &str) -> PathBuf {
     state.data_dir.join("projects").join(project_id)
 }
