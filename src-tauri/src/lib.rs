@@ -125,6 +125,96 @@ async fn check_youtube_copyright(
 }
 
 #[tauri::command]
+async fn pull_ollama_model(
+    app: tauri::AppHandle,
+    model_name: String,
+) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    
+    let mut response = client
+        .post("http://localhost:11434/api/pull")
+        .json(&serde_json::json!({
+            "name": model_name,
+            "stream": true,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to Ollama: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("Ollama pull returned status {status}: {text}"));
+    }
+
+    let mut buffer = String::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        let chunk_str = String::from_utf8_lossy(&chunk);
+        buffer.push_str(&chunk_str);
+
+        // Process lines in buffer
+        while let Some(pos) = buffer.find('\n') {
+            let line = buffer[..pos].trim().to_string();
+            buffer = buffer[pos + 1..].to_string();
+
+            if line.is_empty() {
+                continue;
+            }
+
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(err_msg) = val.get("error").and_then(|v| v.as_str()) {
+                    return Err(err_msg.to_string());
+                }
+
+                let completed = val.get("completed").and_then(|v| v.as_u64());
+                let total = val.get("total").and_then(|v| v.as_u64());
+
+                let mut status = val.get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Downloading...")
+                    .to_string();
+
+                if status.starts_with("downloading ") {
+                    if let (Some(c), Some(t)) = (completed, total) {
+                        let c_mb = c as f64 / 1024.0 / 1024.0;
+                        let t_mb = t as f64 / 1024.0 / 1024.0;
+                        if t_mb > 100.0 {
+                            status = format!("Downloading weights: {:.1} MB / {:.1} MB", c_mb, t_mb);
+                        } else {
+                            status = format!("Downloading model components: {:.1} MB / {:.1} MB", c_mb, t_mb);
+                        }
+                    } else {
+                        status = "Downloading model components...".to_string();
+                    }
+                }
+                
+                let percentage = if let (Some(c), Some(t)) = (completed, total) {
+                    if t > 0 {
+                        Some((c as f64 / t as f64) * 100.0)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let payload = PullProgressPayload {
+                    status,
+                    completed,
+                    total,
+                    percentage,
+                };
+
+                let _ = app.emit("ollama-pull-progress", payload);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+
+#[tauri::command]
 async fn install_ollama(app: tauri::AppHandle) -> Result<(), String> {
     let _ = app.emit("ollama-install-status", "Checking if Ollama is already installed...");
     let launch = std::process::Command::new("open")
